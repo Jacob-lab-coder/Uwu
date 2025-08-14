@@ -1,146 +1,157 @@
---// Local Chess vs Bot (Legal Moves + Hidden Enemy) by ChatGPT
---// Single LocalScript for executors. You are White; bot is Black (hidden).
---// Features: legal moves (incl. check, castling, en passant, promotion=Q), random bot.
---// Controls: Click your piece, then a target square. Press Delete to clean up.
+--// Local Chess vs Bot (Executor-Friendly) - Lightweight Blocks + Labels
+--// Features:
+--//  • Builds its own 8x8 board locally (no game dependencies).
+--//  • Shows ONLY your (White) pieces; Black is hidden but fully simulated.
+--//  • Legal moves for all pieces (no moving into check).
+--//  • Pawn single/double forward, diagonal capture, promotion to Queen.
+--//  • Bot auto-moves after you (simple capture-first heuristic).
+--//  • Press Delete to clean up.
 
--- ======= CONFIG =======
+--==================== CONFIG ====================--
+local BOARD_NAME = "ExecChess_LocalBoard"
 local SQUARE_SIZE = 4
 local BOARD_Y = 3
 local LIGHT = Color3.fromRGB(240,217,181)
 local DARK  = Color3.fromRGB(181,136,99)
-local MY_COLOR = Color3.fromRGB(255,255,255)   -- White pieces (you)
-local HILIGHT_MOVE = Color3.fromRGB(0,255,127)
-local BOARD_NAME = "LocalChess_AI_Board"
+local MY_GLYPH = {K="♔",Q="♕",R="♖",B="♗",N="♘",P="♙"} -- white glyphs
+local MY_COLOR = Color3.fromRGB(255,255,255) -- white piece label color
+local MOVE_HILITE = Color3.fromRGB(0,255,127)
+local BOT_HILITE  = Color3.fromRGB(255,140,0)
 
--- ======= SERVICES =======
+--==================== SERVICES ====================--
 local Players = game:GetService("Players")
-local RunService = game:GetService("RunService")
 local UIS = game:GetService("UserInputService")
-local TweenService = game:GetService("TweenService")
+local RunService = game:GetService("RunService")
+
 local LP = Players.LocalPlayer
-local Mouse = LP:GetMouse()
 
--- ======= CLEAN OLD =======
-pcall(function() local old = workspace:FindFirstChild(BOARD_NAME); if old then old:Destroy() end end)
+--==================== CLEAN OLD ====================--
+pcall(function()
+    local old = workspace:FindFirstChild(BOARD_NAME)
+    if old then old:Destroy() end
+end)
 
-local BoardFolder = Instance.new("Folder")
-BoardFolder.Name = BOARD_NAME
-BoardFolder.Parent = workspace
+local Root = Instance.new("Folder")
+Root.Name = BOARD_NAME
+Root.Parent = workspace
 
--- Cleanup bind
+-- Cleanup keybind
 local cleanupConn
-cleanupConn = UIS.InputBegan:Connect(function(io,gpe)
+cleanupConn = UIS.InputBegan:Connect(function(io, gpe)
     if gpe then return end
     if io.KeyCode == Enum.KeyCode.Delete then
-        if BoardFolder and BoardFolder.Parent then BoardFolder:Destroy() end
+        if Root and Root.Parent then Root:Destroy() end
         if cleanupConn then cleanupConn:Disconnect() end
     end
 end)
 
--- ======= POSITIONING =======
-local function getSpawnCFrame()
+--==================== POSITIONING ====================--
+local function safeGetHRP()
     local char = LP.Character or LP.CharacterAdded:Wait()
-    local hrp = char:FindFirstChild("HumanoidRootPart") or char:WaitForChild("HumanoidRootPart")
-    local forward = hrp.CFrame.LookVector
-    local origin = hrp.Position + forward * 12
-    return CFrame.new(math.floor(origin.X+0.5), BOARD_Y, math.floor(origin.Z+0.5))
+    local hrp = char:FindFirstChild("HumanoidRootPart")
+    while not hrp do
+        char = LP.Character or LP.CharacterAdded:Wait()
+        hrp = char:FindFirstChild("HumanoidRootPart")
+        RunService.Heartbeat:Wait()
+    end
+    return hrp
 end
-local originCF = getSpawnCFrame()
 
--- Base
-local base = Instance.new("Part")
-base.Name = "Base"
-base.Anchored = true
-base.CanCollide = false
-base.Material = Enum.Material.SmoothPlastic
-base.Color = Color3.fromRGB(90,90,90)
-base.Size = Vector3.new(SQUARE_SIZE*8 + 2, 0.2, SQUARE_SIZE*8 + 2)
-base.CFrame = originCF + Vector3.new(0, -0.11, 0)
-base.Parent = BoardFolder
+local function getSpawnCF()
+    local hrp = safeGetHRP()
+    local forward = hrp.CFrame.LookVector
+    local pos = hrp.Position + forward * 12
+    return CFrame.new(math.floor(pos.X+0.5), BOARD_Y, math.floor(pos.Z+0.5))
+end
 
--- ======= BOARD STATE =======
--- Piece encoding: {c="w"/"b", t="KQRBNP"}; empty = nil
--- Board indices: f=1..8 (A..H), r=1..8 (1..8). White at r=1 (bottom).
+local originCF = getSpawnCF()
+
+-- Base plate (helps clicking)
+local Base = Instance.new("Part")
+Base.Name = "Base"
+Base.Anchored = true
+Base.CanCollide = false
+Base.Material = Enum.Material.SmoothPlastic
+Base.Color = Color3.fromRGB(90,90,90)
+Base.Size = Vector3.new(SQUARE_SIZE*8 + 2, 0.2, SQUARE_SIZE*8 + 2)
+Base.CFrame = originCF + Vector3.new(0, -0.11, 0)
+Base.Parent = Root
+
+--==================== BOARD STATE ====================--
+-- board[f][r] = {c="w"/"b", t="KQRBNP"} or nil; files A..H => 1..8; ranks 1..8 (White at r=1)
 local files = {"A","B","C","D","E","F","G","H"}
-local function nameSquare(f,r) return files[f]..tostring(r) end
+local function sqName(f,r) return files[f]..tostring(r) end
+local function inBounds(f,r) return f>=1 and f<=8 and r>=1 and r<=8 end
 
-local function clonePiece(p) if not p then return nil end return {c=p.c, t=p.t} end
+local board = {}
+for f=1,8 do board[f] = {} end
 
-local board = {}; for f=1,8 do board[f] = {}; end
-local sideToMove = "w"
-local whiteCastleK, whiteCastleQ = true, true
-local blackCastleK, blackCastleQ = true, true
-local epSquare = nil  -- {f=,r=} en passant target square
-local halfmoveClock = 0
-local fullmoveNumber = 1
-local gameOver = false
-
--- Initial setup
-local function setupInitial()
+local function setupStart()
+    -- Pawns
     for f=1,8 do
         board[f][2] = {c="w", t="P"}
         board[f][7] = {c="b", t="P"}
     end
+    -- Back ranks
     local back = {"R","N","B","Q","K","B","N","R"}
     for f=1,8 do
         board[f][1] = {c="w", t=back[f]}
         board[f][8] = {c="b", t=back[f]}
     end
-    sideToMove = "w"
-    whiteCastleK, whiteCastleQ = true, true
-    blackCastleK, blackCastleQ = true, true
-    epSquare = nil
-    halfmoveClock = 0
-    fullmoveNumber = 1
-    gameOver = false
 end
-setupInitial()
+setupStart()
 
--- ======= RENDER (Squares + My Pieces Only) =======
-local squares = {} -- Part grid
-local labels  = {} -- TextLabel for my pieces (white)
+local sideToMove = "w"
+local gameOver = false
+local random = Random.new()
+
+--==================== RENDER (Squares + My Pieces Only) ====================--
+local squares = {}  -- Part grid
+local labels  = {}  -- TextLabel (for white only)
+
 for f=1,8 do
     squares[f] = {}
     labels[f] = {}
     for r=1,8 do
-        local part = Instance.new("Part")
-        part.Name = nameSquare(f,r)
-        part.Anchored = true
-        part.CanCollide = true
-        part.Material = Enum.Material.SmoothPlastic
-        part.Size = Vector3.new(SQUARE_SIZE, 0.2, SQUARE_SIZE)
-        local xOffset = (f-4.5) * SQUARE_SIZE
-        local zOffset = (r-4.5) * SQUARE_SIZE
-        part.CFrame = originCF * CFrame.new(xOffset, 0, zOffset)
-        part.Color = ((f + r) % 2 == 0) and LIGHT or DARK
-        part.Parent = BoardFolder
-        squares[f][r] = part
+        local p = Instance.new("Part")
+        p.Name = sqName(f,r)
+        p.Anchored = true
+        p.CanCollide = true
+        p.Material = Enum.Material.SmoothPlastic
+        p.Size = Vector3.new(SQUARE_SIZE, 0.2, SQUARE_SIZE)
+        local x = (f-4.5)*SQUARE_SIZE
+        local z = (r-4.5)*SQUARE_SIZE
+        p.CFrame = originCF * CFrame.new(x, 0, z)
+        p.Color = ((f + r) % 2 == 0) and LIGHT or DARK
+        p.Parent = Root
+        squares[f][r] = p
 
+        -- piece billboard (white only shown)
         local bb = Instance.new("BillboardGui")
-        bb.Name = "PieceBillboard"
+        bb.Name = "Glyph"
         bb.Size = UDim2.new(0, SQUARE_SIZE*10, 0, SQUARE_SIZE*10)
         bb.StudsOffset = Vector3.new(0, 1.5, 0)
         bb.AlwaysOnTop = true
-        bb.Adornee = part
-        bb.Parent = part
+        bb.Adornee = p
+        bb.Parent = p
 
         local tl = Instance.new("TextLabel")
-        tl.Size = UDim2.new(1, 0, 1, 0)
         tl.BackgroundTransparency = 1
+        tl.Size = UDim2.new(1,0,1,0)
         tl.TextScaled = true
         tl.Font = Enum.Font.SourceSansBold
-        tl.TextColor3 = Color3.new(1,1,1)
-        tl.TextStrokeTransparency = 0.4
+        tl.TextColor3 = MY_COLOR
         tl.Text = ""
         tl.Parent = bb
         labels[f][r] = tl
 
-        -- tiny square name
+        -- corner label
         local surf = Instance.new("SurfaceGui")
         surf.Face = Enum.NormalId.Top
         surf.CanvasSize = Vector2.new(256,256)
         surf.AlwaysOnTop = true
-        surf.Parent = part
+        surf.Parent = p
+
         local tiny = Instance.new("TextLabel")
         tiny.BackgroundTransparency = 1
         tiny.Size = UDim2.new(0, 60, 0, 60)
@@ -148,544 +159,386 @@ for f=1,8 do
         tiny.Font = Enum.Font.SourceSans
         tiny.TextScaled = true
         tiny.TextColor3 = Color3.fromRGB(30,30,30)
-        tiny.Text = part.Name
+        tiny.Text = p.Name
         tiny.Parent = surf
     end
 end
 
--- Show only my (white) pieces
-local WHITE_GLYPH = {K="♔",Q="♕",R="♖",B="♗",N="♘",P="♙"}
+local selectBox = Instance.new("SelectionBox")
+selectBox.LineThickness = 0.05
+selectBox.Color3 = MOVE_HILITE
+selectBox.Visible = false
+selectBox.Parent = Root
+
 local function render()
     for f=1,8 do
         for r=1,8 do
             local p = board[f][r]
             local tl = labels[f][r]
             if p and p.c=="w" then
-                tl.Text = WHITE_GLYPH[p.t] or ""
-                tl.TextColor3 = MY_COLOR
+                tl.Text = MY_GLYPH[p.t] or ""
             else
-                tl.Text = "" -- hide black
+                tl.Text = "" -- hide black pieces
             end
         end
     end
 end
 render()
 
--- Selection and move highlights
-local selectBox = Instance.new("SelectionBox")
-selectBox.LineThickness = 0.05
-selectBox.Color3 = HILIGHT_MOVE
-selectBox.Visible = false
-selectBox.Parent = BoardFolder
+--==================== MOVE GENERATION ====================--
+local function clonePiece(p) if not p then return nil end return {c=p.c, t=p.t} end
 
-local lastBotFrom, lastBotTo = nil, nil
-local function flashBotMove(fr, to)
-    if not fr or not to then return end
-    local a = Instance.new("SelectionBox")
-    a.LineThickness = 0.05; a.Color3 = Color3.fromRGB(255,120,0)
-    a.Adornee = squares[fr.f][fr.r]; a.Parent = BoardFolder; a.Visible = true
-    local b = Instance.new("SelectionBox")
-    b.LineThickness = 0.05; b.Color3 = Color3.fromRGB(255,120,0)
-    b.Adornee = squares[to.f][to.r]; b.Parent = BoardFolder; b.Visible = true
-    task.delay(0.7, function() pcall(function() a:Destroy() end); pcall(function() b:Destroy() end) end)
-end
-
-local function setSelected(fr)
-    if fr then
-        selectBox.Adornee = squares[fr.f][fr.r]
-        selectBox.Visible = true
-    else
-        selectBox.Visible = false
-        selectBox.Adornee = nil
-    end
-end
-
--- ======= MOVE GENERATION / RULES =======
-local function inBounds(f,r) return f>=1 and f<=8 and r>=1 and r<=8 end
 local function kingPos(color)
-    for f=1,8 do for r=1,8 do local p=board[f][r]; if p and p.c==color and p.t=="K" then return {f=f,r=r} end end end
+    for f=1,8 do for r=1,8 do local p=board[f][r]
+        if p and p.c==color and p.t=="K" then return {f=f,r=r} end
+    end end
     return nil
 end
 
-local function isSquareAttackedBy(f,r,attackerColor)
-    -- scan directions
-    local function anyAt(df,dr, pieces)
-        local ff, rr = f+df, r+dr
+local function isSquareAttackedBy(f,r,att)
+    -- Rook/Queen lines
+    local function ray(df,dr, allow)
+        local ff,rr=f+df,r+dr
         while inBounds(ff,rr) do
-            local p = board[ff][rr]
-            if p then
-                if p.c==attackerColor then
-                    if pieces[p.t] then return true end
-                end
-                break
+            local q = board[ff][rr]
+            if q then
+                if q.c==att and allow[q.t] then return true end
+                return false
             end
-            ff, rr = ff+df, rr+dr
+            ff,rr=ff+df,rr+dr
         end
         return false
     end
-    -- rook/queen lines
-    if anyAt(1,0, {R=true,Q=true}) then return true end
-    if anyAt(-1,0,{R=true,Q=true}) then return true end
-    if anyAt(0,1, {R=true,Q=true}) then return true end
-    if anyAt(0,-1,{R=true,Q=true}) then return true end
-    -- bishop/queen diagonals
-    if anyAt(1,1,  {B=true,Q=true}) then return true end
-    if anyAt(1,-1, {B=true,Q=true}) then return true end
-    if anyAt(-1,1, {B=true,Q=true}) then return true end
-    if anyAt(-1,-1,{B=true,Q=true}) then return true end
-    -- knights
-    local kdelta = {{1,2},{2,1},{-1,2},{-2,1},{1,-2},{2,-1},{-1,-2},{-2,-1}}
-    for _,d in ipairs(kdelta) do
-        local ff, rr = f+d[1], r+d[2]
+    if ray(1,0,{R=true,Q=true}) then return true end
+    if ray(-1,0,{R=true,Q=true}) then return true end
+    if ray(0,1,{R=true,Q=true}) then return true end
+    if ray(0,-1,{R=true,Q=true}) then return true end
+    -- Bishop/Queen diagonals
+    if ray(1,1,{B=true,Q=true}) then return true end
+    if ray(1,-1,{B=true,Q=true}) then return true end
+    if ray(-1,1,{B=true,Q=true}) then return true end
+    if ray(-1,-1,{B=true,Q=true}) then return true end
+    -- Knights
+    local kd={{1,2},{2,1},{-1,2},{-2,1},{1,-2},{2,-1},{-1,-2},{-2,-1}}
+    for _,d in ipairs(kd) do
+        local ff,rr=f+d[1], r+d[2]
         if inBounds(ff,rr) then
-            local p = board[ff][rr]
-            if p and p.c==attackerColor and p.t=="N" then return true end
+            local q=board[ff][rr]
+            if q and q.c==att and q.t=="N" then return true end
         end
     end
-    -- pawns
-    if attackerColor=="w" then
+    -- Pawns
+    if att=="w" then
         for _,df in ipairs({-1,1}) do
-            local ff, rr = f+df, r-1
+            local ff,rr=f+df, r-1
             if inBounds(ff,rr) then
-                local p = board[ff][rr]; if p and p.c=="w" and p.t=="P" then return true end
+                local q=board[ff][rr]
+                if q and q.c=="w" and q.t=="P" then return true end
             end
         end
     else
         for _,df in ipairs({-1,1}) do
-            local ff, rr = f+df, r+1
+            local ff,rr=f+df, r+1
             if inBounds(ff,rr) then
-                local p = board[ff][rr]; if p and p.c=="b" and p.t=="P" then return true end
+                local q=board[ff][rr]
+                if q and q.c=="b" and q.t=="P" then return true end
             end
         end
     end
-    -- king adjacents
+    -- King adjacent
     for df=-1,1 do for dr=-1,1 do
         if not (df==0 and dr==0) then
             local ff,rr=f+df,r+dr
             if inBounds(ff,rr) then
-                local p=board[ff][rr]
-                if p and p.c==attackerColor and p.t=="K" then return true end
+                local q=board[ff][rr]
+                if q and q.c==att and q.t=="K" then return true end
             end
         end
     end end
     return false
 end
 
-local function isInCheck(color)
-    local kp = kingPos(color)
-    if not kp then return false end
-    return isSquareAttackedBy(kp.f, kp.r, color=="w" and "b" or "w")
-end
-
--- Make/Unmake (for testing legality)
-local history = {}
 local function makeMove(m)
-    -- m: {from={f,r}, to={f,r}, piece, capturePiece?, isCastleK?, isCastleQ?, isEP?, promo?}
-    local rec = {
-        from = {f=m.from.f, r=m.from.r},
-        to = {f=m.to.f, r=m.to.r},
-        moved = clonePiece(m.piece),
-        captured = m.capturePiece and clonePiece(m.capturePiece) or nil,
-        prevWCK=whiteCastleK, prevWCQ=whiteCastleQ, prevBCK=blackCastleK, prevBCQ=blackCastleQ,
-        prevEP = epSquare and {f=epSquare.f, r=epSquare.r} or nil,
-        prevHalf = halfmoveClock, prevSide = sideToMove
-    }
-    table.insert(history, rec)
-
+    -- m = {from={f,r}, to={f,r}, piece, captured?, promo?}
+    local from, to = m.from, m.to
     -- move piece
-    board[m.to.f][m.to.r] = clonePiece(m.piece)
-    board[m.from.f][m.from.r] = nil
-
-    -- en passant capture
-    if m.isEP and m.piece.t=="P" and m.captureSquare then
-        board[m.captureSquare.f][m.captureSquare.r] = nil
+    board[to.f][to.r] = clonePiece(m.piece)
+    board[from.f][from.r] = nil
+    -- promotion to Queen
+    if m.promo then
+        board[to.f][to.r].t = m.promo
     end
-
-    -- promotion (to Queen)
-    if m.promo and board[m.to.f][m.to.r] then
-        board[m.to.f][m.to.r].t = m.promo
-    end
-
-    -- castling: move rook
-    if m.isCastleK then
-        if m.piece.c=="w" then
-            board[6][1] = board[5][1]; board[5][1] = nil
-            board[5][1] = nil
-            board[6][1] = {c="w", t="K"}
-            board[5][1] = nil
-            board[8][1], board[7][1] = nil, {c="w", t="R"}
-        else
-            board[6][8] = board[5][8]; board[5][8] = nil
-            board[8][8], board[7][8] = nil, {c="b", t="R"}
-        end
-    elseif m.isCastleQ then
-        if m.piece.c=="w" then
-            board[4][1] = board[5][1]; board[5][1] = nil
-            board[1][1], board[3][1] = nil, {c="w", t="R"}
-        else
-            board[4][8] = board[5][8]; board[5][8] = nil
-            board[1][8], board[3][8] = nil, {c="b", t="R"}
-        end
-    end
-
-    -- update castling rights
-    local function touch(f,r, color, typ)
-        local p = rec.moved
-        if p and p.t=="K" and p.c=="w" then whiteCastleK, whiteCastleQ=false,false end
-        if p and p.t=="K" and p.c=="b" then blackCastleK, blackCastleQ=false,false end
-        -- if a rook moves or gets captured, remove its side right
-        if p and p.t=="R" and p.c=="w" then
-            if rec.from.f==1 and rec.from.r==1 then whiteCastleQ=false end
-            if rec.from.f==8 and rec.from.r==1 then whiteCastleK=false end
-        end
-        if p and p.t=="R" and p.c=="b" then
-            if rec.from.f==1 and rec.from.r==8 then blackCastleQ=false end
-            if rec.from.f==8 and rec.from.r==8 then blackCastleK=false end
-        end
-        if rec.captured then
-            if rec.to.f==1 and rec.to.r==(rec.captured.c=="w" and 1 or 8) and rec.captured.t=="R" then
-                if rec.captured.c=="w" then whiteCastleQ=false else blackCastleQ=false end
-            end
-            if rec.to.f==8 and rec.to.r==(rec.captured.c=="w" and 1 or 8) and rec.captured.t=="R" then
-                if rec.captured.c=="w" then whiteCastleK=false else blackCastleK=false end
-            end
-        end
-    end
-    touch()
-
-    -- update EP
-    epSquare = nil
-    if m.piece.t=="P" then
-        if math.abs(m.to.r - m.from.r) == 2 then
-            epSquare = {f=m.from.f, r=(m.from.r + m.to.r)/2}
-        end
-    end
-
-    -- halfmove clock
-    if m.piece.t=="P" or m.capturePiece then halfmoveClock = 0 else halfmoveClock = halfmoveClock + 1 end
-    if sideToMove=="b" then fullmoveNumber = fullmoveNumber + 1 end
-
-    sideToMove = (sideToMove=="w") and "b" or "w"
+    -- return undo record
+    return {
+        from = {f=from.f,r=from.r},
+        to   = {f=to.f, r=to.r},
+        movedType = m.piece.t,
+        captured  = m.captured and clonePiece(m.captured) or nil
+    }
 end
 
-local function unmakeMove()
-    local rec = history[#history]; history[#history]=nil
-    if not rec then return end
-    sideToMove = rec.prevSide
-    whiteCastleK, whiteCastleQ = rec.prevWCK, rec.prevWCQ
-    blackCastleK, blackCastleQ = rec.prevBCK, rec.prevBCQ
-    epSquare = rec.prevEP and {f=rec.prevEP.f, r=rec.prevEP.r} or nil
-    halfmoveClock = rec.prevHalf
-
-    -- restore board
-    local moved = rec.moved
-    local toP = board[rec.to.f][rec.to.r]
-    board[rec.from.f][rec.from.r] = clonePiece(moved)
+local function unmakeMove(rec)
+    local moved = board[rec.to.f][rec.to.r]
+    board[rec.from.f][rec.from.r] = moved and {c=moved.c, t=rec.movedType} or {c="w",t=rec.movedType} -- restore type
     board[rec.to.f][rec.to.r] = rec.captured and clonePiece(rec.captured) or nil
-
-    -- special cases: EP / castling
-    -- Detect EP by mismatch: if moved pawn moved diagonally without captured piece then EP occurred
-    if moved.t=="P" and rec.captured and not (rec.to.f==rec.from.f) and not board[rec.to.f][rec.to.r] then
-        -- put captured pawn back to its square behind 'to'
-        local dir = (moved.c=="w") and -1 or 1
-        board[rec.to.f][rec.to.r+dir] = clonePiece(rec.captured)
-    end
-    -- Castling restore (detect by king 2-square move)
-    if moved.t=="K" and math.abs(rec.to.f - rec.from.f) == 2 then
-        if moved.c=="w" then
-            -- undo rook move
-            if rec.to.f==7 then -- king-side
-                board[8][1], board[7][1] = {c="w",t="R"}, nil
-            else -- queen-side
-                board[1][1], board[3][1] = {c="w",t="R"}, nil
-            end
-        else
-            if rec.to.f==7 then
-                board[8][8], board[7][8] = {c="b",t="R"}, nil
-            else
-                board[1][8], board[3][8] = {c="b",t="R"}, nil
-            end
-        end
-    end
 end
 
-local function addMove(moves, from, to, piece, capture, extras)
-    local m = {from=from, to=to, piece=piece, capturePiece=capture}
-    if extras then for k,v in pairs(extras) do m[k]=v end end
-    table.insert(moves, m)
+local function add(moves, from, to, piece, captured, promo)
+    table.insert(moves, {from=from,to=to,piece=piece,captured=captured,promo=promo})
 end
 
--- Pseudo-legal moves (not checking king safety yet)
+-- Pseudo-legal moves (no self-check test yet)
 local function genPseudo(color)
     local moves = {}
-    local dir = (color=="w") and 1 or -1
     for f=1,8 do for r=1,8 do
         local p = board[f][r]
         if p and p.c==color then
+            local from = {f=f,r=r}
             if p.t=="P" then
-                local fr = {f=f,r=r}
-                -- forward
+                local dir = (color=="w") and 1 or -1
+                local start = (color=="w") and 2 or 7
+                local promoRank = (color=="w") and 8 or 1
+                -- forward 1
                 local one = r+dir
                 if inBounds(f,one) and not board[f][one] then
-                    -- promotion?
-                    local promoRank = (color=="w") and 8 or 1
-                    if one == promoRank then
-                        addMove(moves, fr, {f=f,r=one}, p, nil, {promo="Q"})
+                    if one==promoRank then
+                        add(moves, from, {f=f,r=one}, p, nil, "Q")
                     else
-                        addMove(moves, fr, {f=f,r=one}, p, nil)
-                        -- double
-                        local startRank = (color=="w") and 2 or 7
+                        add(moves, from, {f=f,r=one}, p, nil, nil)
+                        -- forward 2 from start
                         local two = r+2*dir
-                        if r==startRank and not board[f][two] then
-                            addMove(moves, fr, {f=f,r=two}, p, nil)
+                        if r==start and not board[f][two] then
+                            add(moves, from, {f=f,r=two}, p, nil, nil)
                         end
                     end
                 end
                 -- captures
                 for _,df in ipairs({-1,1}) do
-                    local ff, rr = f+df, r+dir
+                    local ff,rr=f+df, r+dir
                     if inBounds(ff,rr) then
-                        local cap = board[ff][rr]
-                        if cap and cap.c ~= color then
-                            local promoRank = (color=="w") and 8 or 1
+                        local cap=board[ff][rr]
+                        if cap and cap.c~=color then
                             if rr==promoRank then
-                                addMove(moves, fr, {f=ff,r=rr}, p, cap, {promo="Q"})
+                                add(moves, from, {f=ff,r=rr}, p, cap, "Q")
                             else
-                                addMove(moves, fr, {f=ff,r=rr}, p, cap)
-                            end
-                        end
-                    end
-                end
-                -- en passant
-                if epSquare then
-                    for _,df in ipairs({-1,1}) do
-                        local ff = f+df
-                        if ff==epSquare.f and epSquare.r==r+dir then
-                            -- capture square is behind ep target
-                            local capSq = {f=ff, r=r}
-                            local capPiece = board[capSq.f][capSq.r]
-                            if capPiece and capPiece.c ~= color and capPiece.t=="P" then
-                                addMove(moves, fr, {f=ff,r=r+dir}, p, capPiece, {isEP=true, captureSquare=capSq})
+                                add(moves, from, {f=ff,r=rr}, p, cap, nil)
                             end
                         end
                     end
                 end
             elseif p.t=="N" then
-                local deltas={{1,2},{2,1},{-1,2},{-2,1},{1,-2},{2,-1},{-1,-2},{-2,-1}}
-                for _,d in ipairs(deltas) do
-                    local ff,rr=f+d[1],r+d[2]
+                local d={{1,2},{2,1},{-1,2},{-2,1},{1,-2},{2,-1},{-1,-2},{-2,-1}}
+                for _,v in ipairs(d) do
+                    local ff,rr=f+v[1], r+v[2]
                     if inBounds(ff,rr) then
                         local q=board[ff][rr]
-                        if not q or q.c~=color then addMove(moves,{f=f,r=r},{f=ff,r=rr},p,q) end
+                        if not q or q.c~=color then add(moves, from, {f=ff,r=rr}, p, q, nil) end
                     end
                 end
             elseif p.t=="B" or p.t=="R" or p.t=="Q" then
-                local rays = {}
-                if p.t=="B" or p.t=="Q" then
-                    table.insert(rays,{1,1}); table.insert(rays,{1,-1}); table.insert(rays,{-1,1}); table.insert(rays,{-1,-1})
-                end
-                if p.t=="R" or p.t=="Q" then
-                    table.insert(rays,{1,0}); table.insert(rays,{-1,0}); table.insert(rays,{0,1}); table.insert(rays,{0,-1})
-                end
+                local rays={}
+                if p.t~="R" then table.insert(rays,{1,1}); table.insert(rays,{1,-1}); table.insert(rays,{-1,1}); table.insert(rays,{-1,-1}) end
+                if p.t~="B" then table.insert(rays,{1,0}); table.insert(rays,{-1,0}); table.insert(rays,{0,1}); table.insert(rays,{0,-1}) end
                 for _,d in ipairs(rays) do
-                    local ff,rr=f+d[1],r+d[2]
+                    local ff,rr=f+d[1], r+d[2]
                     while inBounds(ff,rr) do
                         local q=board[ff][rr]
                         if not q then
-                            addMove(moves,{f=f,r=r},{f=ff,r=rr},p,nil)
+                            add(moves, from, {f=ff,r=rr}, p, nil, nil)
                         else
-                            if q.c~=color then addMove(moves,{f=f,r=r},{f=ff,r=rr},p,q) end
+                            if q.c~=color then add(moves, from, {f=ff,r=rr}, p, q, nil) end
                             break
                         end
-                        ff,rr=ff+d[1],rr+d[2]
+                        ff,rr=ff+d[1], rr+d[2]
                     end
                 end
             elseif p.t=="K" then
                 for df=-1,1 do for dr=-1,1 do
                     if not (df==0 and dr==0) then
-                        local ff,rr=f+df,r+dr
+                        local ff,rr=f+df, r+dr
                         if inBounds(ff,rr) then
                             local q=board[ff][rr]
-                            if not q or q.c~=color then addMove(moves,{f=f,r=r},{f=ff,r=rr},p,q) end
+                            if not q or q.c~=color then add(moves, from, {f=ff,r=rr}, p, q, nil) end
                         end
                     end
                 end end
-                -- castling (pseudo)
-                if color=="w" and r==1 and f==5 then
-                    if whiteCastleK and not board[6][1] and not board[7][1] then
-                        addMove(moves,{f=5,r=1},{f=7,r=1},p,nil,{isCastleK=true})
-                    end
-                    if whiteCastleQ and not board[4][1] and not board[3][1] and not board[2][1] then
-                        addMove(moves,{f=5,r=1},{f=3,r=1},p,nil,{isCastleQ=true})
-                    end
-                elseif color=="b" and r==8 and f==5 then
-                    if blackCastleK and not board[6][8] and not board[7][8] then
-                        addMove(moves,{f=5,r=8},{f=7,r=8},p,nil,{isCastleK=true})
-                    end
-                    if blackCastleQ and not board[4][8] and not board[3][8] and not board[2][8] then
-                        addMove(moves,{f=5,r=8},{f=3,r=8},p,nil,{isCastleQ=true})
-                    end
-                end
             end
         end
     end end
     return moves
 end
 
--- Filter to legal (king not left in check; castling can’t pass/check through attacked squares)
+-- Filter to legal moves (no leaving your king in check)
 local function legalMoves(color)
-    local moves = genPseudo(color)
-    local leg = {}
-    for _,m in ipairs(moves) do
-        -- castle path safety
-        local castleOK = true
-        if m.isCastleK or m.isCastleQ then
-            local r = (color=="w") and 1 or 8
-            local midF = m.isCastleK and 6 or 4
-            local endF = m.isCastleK and 7 or 3
-            -- king cannot be in check, pass through check, or end in check
-            if isSquareAttackedBy(5,r, color=="w" and "b" or "w") then castleOK=false end
-            if isSquareAttackedBy(midF,r, color=="w" and "b" or "w") then castleOK=false end
-            if isSquareAttackedBy(endF,r, color=="w" and "b" or "w") then castleOK=false end
-        end
-        if not castleOK then goto continue end
-        makeMove(m)
-        local ok = not isInCheck(color)
-        unmakeMove()
-        if ok then table.insert(leg, m) end
-        ::continue::
-    end
-    return leg
-end
-
-local function hasAnyLegal(color)
-    local lm = legalMoves(color)
-    return #lm > 0
-end
-
--- ======= TURN / BOT =======
-local function resultMessage(text)
-    warn("[LocalChess] "..text)
-end
-
-local function gameStatusAfter(colorJustMoved)
-    local opp = (colorJustMoved=="w") and "b" or "w"
-    if isInCheck(opp) then
-        if not hasAnyLegal(opp) then
-            gameOver = true
-            resultMessage((opp=="w" and "White" or "Black").." is checkmated. "..(colorJustMoved=="w" and "White" or "Black").." wins!")
+    local ps = genPseudo(color)
+    local legal = {}
+    for _,m in ipairs(ps) do
+        local rec = makeMove(m)
+        local kp = kingPos(color)
+        local inCheck = false
+        if kp then
+            inCheck = isSquareAttackedBy(kp.f, kp.r, (color=="w") and "b" or "w")
         else
-            resultMessage((opp=="w" and "White" or "Black").." is in check.")
+            inCheck = true
         end
-    else
-        if not hasAnyLegal(opp) then
-            gameOver = true
-            resultMessage("Stalemate.")
-        end
+        unmakeMove(rec)
+        if not inCheck then table.insert(legal, m) end
     end
+    return legal
 end
 
-local random = Random.new()
+local function anyLegal(color) return #legalMoves(color) > 0 end
+
+--==================== GAME FLOW / BOT ====================--
+local function showBotFlash(fromFR, toFR)
+    local a = Instance.new("SelectionBox")
+    a.LineThickness = 0.05
+    a.Color3 = BOT_HILITE
+    a.Adornee = squares[fromFR.f][fromFR.r]
+    a.Parent = Root
+    local b = Instance.new("SelectionBox")
+    b.LineThickness = 0.05
+    b.Color3 = BOT_HILITE
+    b.Adornee = squares[toFR.f][toFR.r]
+    b.Parent = Root
+    task.delay(0.6, function() pcall(function() a:Destroy() end) pcall(function() b:Destroy() end) end)
+end
+
+local function announce(msg) print("[ExecChess] "..msg) end
+
+local function checkEnd(lastMover)
+    local opp = (lastMover=="w") and "b" or "w"
+    local oppInCheck
+    local kp = kingPos(opp)
+    if not kp then
+        gameOver = true
+        announce((lastMover=="w" and "White" or "Black").." wins (king captured).")
+        return true
+    end
+    oppInCheck = isSquareAttackedBy(kp.f, kp.r, (opp=="w") and "b" or "w")
+    local hasMoves = anyLegal(opp)
+    if oppInCheck and not hasMoves then
+        gameOver = true
+        announce((opp=="w" and "White" or "Black").." is checkmated. "..(lastMover=="w" and "White" or "Black").." wins!")
+        return true
+    elseif (not oppInCheck) and (not hasMoves) then
+        gameOver = true
+        announce("Stalemate.")
+        return true
+    end
+    return false
+end
 
 local function botMove()
-    if gameOver then return end
-    if sideToMove ~= "b" then return end
+    if gameOver or sideToMove ~= "b" then return end
     local moves = legalMoves("b")
     if #moves==0 then
-        gameStatusAfter("b")
-        render()
-        return
+        checkEnd("b"); render(); return
     end
-    -- simple heuristic: prefer captures; else random
-    local caps, noncaps = {}, {}
+    -- Prefer captures a little; else random
+    local captures, others = {}, {}
     for _,m in ipairs(moves) do
-        if m.capturePiece then table.insert(caps,m) else table.insert(noncaps,m) end
+        if m.captured then table.insert(captures, m) else table.insert(others, m) end
     end
     local pick
-    if #caps>0 then pick = caps[random:NextInteger(1,#caps)] else pick = noncaps[random:NextInteger(1,#noncaps)] end
+    if #captures > 0 then
+        pick = captures[random:NextInteger(1, #captures)]
+    else
+        pick = others[random:NextInteger(1, #others)]
+    end
 
-    -- store bot move from/to for visual flash
     local fromFR = {f=pick.from.f, r=pick.from.r}
-    local toFR   = {f=pick.to.f, r=pick.to.r}
+    local toFR   = {f=pick.to.f,   r=pick.to.r}
 
     makeMove(pick)
+    sideToMove = "w"
     render()
-    flashBotMove(fromFR, toFR)
-    gameStatusAfter("b")
+    showBotFlash(fromFR, toFR)
+    checkEnd("b")
 end
 
--- ======= INPUT: SELECT + MOVE =======
-local function partToFR(part)
-    if not part or not part:IsDescendantOf(BoardFolder) then return nil end
-    local n = part.Name
-    local fileChar = string.sub(n,1,1)
-    local rankNum = tonumber(string.sub(n,2))
+--==================== INPUT (CLICK TO MOVE) ====================--
+local Mouse = LP:GetMouse()
+
+local function nameToFR(name)
+    local file = string.sub(name,1,1)
+    local rank = tonumber(string.sub(name,2))
     local fIdx
-    for i,v in ipairs(files) do if v==fileChar then fIdx=i break end end
-    if not fIdx or not rankNum then return nil end
-    if fIdx<1 or fIdx>8 or rankNum<1 or rankNum>8 then return nil end
-    return {f=fIdx, r=rankNum}
+    for i,v in ipairs(files) do if v==file then fIdx=i break end end
+    if not fIdx or not rank then return nil end
+    if not inBounds(fIdx, rank) then return nil end
+    return {f=fIdx, r=rank}
 end
 
 local selected = nil
 
-local function onClickSquare(fr)
-    if gameOver then return end
-    if sideToMove ~= "w" then return end
+local function setSelected(fr)
+    if fr then
+        selectBox.Adornee = squares[fr.f][fr.r]
+        selectBox.Visible = true
+    else
+        selectBox.Adornee = nil
+        selectBox.Visible = false
+    end
+end
+
+local clicking = false
+Mouse.Button1Down:Connect(function()
+    if clicking then return end
+    clicking = true
+    local target = Mouse.Target
+    if not target or not target:IsDescendantOf(Root) then clicking=false return end
+    local fr = nameToFR(target.Name)
+    if not fr then clicking=false return end
+    if gameOver then clicking=false return end
+    if sideToMove ~= "w" then clicking=false return end
+
     if not selected then
-        -- select a white piece only
         local p = board[fr.f][fr.r]
         if p and p.c=="w" then
             selected = fr
             setSelected(fr)
         end
     else
+        -- same square = deselect
         if selected.f==fr.f and selected.r==fr.r then
             selected = nil
             setSelected(nil)
+            clicking=false
             return
         end
-        -- try to find a legal move from selected to fr
+        -- try to find a legal move from selected -> fr
         local moves = legalMoves("w")
         local chosen = nil
         for _,m in ipairs(moves) do
             if m.from.f==selected.f and m.from.r==selected.r and m.to.f==fr.f and m.to.r==fr.r then
-                chosen = m; break
+                chosen = m
+                break
             end
         end
         if chosen then
             makeMove(chosen)
+            sideToMove = "b"
             selected = nil
             setSelected(nil)
             render()
-            gameStatusAfter("w")
-            -- bot reply
-            task.delay(0.25, botMove)
+            if not checkEnd("w") then
+                task.delay(0.25, botMove)
+            end
         else
-            -- clicked illegal target; reselect if clicked another white piece
+            -- reselect if clicked another white piece, else clear
             local p2 = board[fr.f][fr.r]
             if p2 and p2.c=="w" then
                 selected = fr
                 setSelected(fr)
             else
-                -- invalid; deselect
                 selected = nil
                 setSelected(nil)
             end
         end
     end
-end
-
--- Mouse handler
-local clicking = false
-Mouse.Button1Down:Connect(function()
-    if clicking then return end
-    clicking = true
-    local part = Mouse.Target
-    local fr = partToFR(part)
-    if fr then onClickSquare(fr) end
     clicking = false
 end)
 
-print("[LocalChess] White vs Bot started. Click a piece, then a square. Bot is hidden. Press Delete to remove.")
+print("[ExecChess] Ready. You are White. Click a piece, then a square. Bot replies. Press Delete to clean up.")
 render()
